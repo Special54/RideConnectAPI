@@ -47,8 +47,7 @@ class ConcurrencyTester {
                 dropoff_lng: -73.9855
             });
 
-            const response = await axios.post(`${this.baseUrl}/rides/request`, {
-                rider_id: 1,
+            const response = await axios.patch(`${this.baseUrl}/rides/1/request`, {
                 pickup_lat: 40.7128,
                 pickup_lng: -74.0060,
                 dropoff_lat: 40.7580,
@@ -89,7 +88,7 @@ class ConcurrencyTester {
         
         const acceptancePromises = Array.from({ length: numberOfDrivers }, (_, index) => {
             const driverId = index + 1;
-            return () => axios.post(`${this.baseUrl}/rides/${rideId}/accept`, {
+            return () => axios.patch(`${this.baseUrl}/rides/${rideId}/accept`, {
                 driver_id: driverId
             }, {
                 headers: {

@@ -1,4 +1,3 @@
-
 // app.js
 const express = require('express');
 const { Pool } = require('pg');
@@ -9,18 +8,21 @@ app.use(express.json());
 const pool = new Pool({
     user: 'postgres',
     host: 'localhost',
-    database: 'rideconnect',
+    database: 'RideApp',
     password: '1',
     port: 5432,
 });
 
 // Helper function to calculate fare
-function calculateFare(distanceKm, durationMinutes) {
-    const BASE_FARE = 5.0;
-    const PER_KM_RATE = 2.0;
-    const PER_MINUTE_RATE = 0.5;
-    
-    return BASE_FARE + (distanceKm * PER_KM_RATE) + (durationMinutes * PER_MINUTE_RATE);
+function calculateFare(distanceKm, durationMinutes, vehicleType) {
+    const vehicleRates = {
+        economy: { baseFare: 5.0, perKmRate: 2.0, perMinuteRate: 0.5 },
+        premium: { baseFare: 10.0, perKmRate: 3.0, perMinuteRate: 1.0 },
+        family: { baseFare: 7.0, perKmRate: 2.5, perMinuteRate: 0.75 }
+    };
+
+    const rates = vehicleRates[vehicleType] || vehicleRates.economy;
+    return rates.baseFare + (distanceKm * rates.perKmRate) + (durationMinutes * rates.perMinuteRate);
 }
 
 // Helper function to generate random route
@@ -35,47 +37,88 @@ function generateRandomRoute(pickup, dropoff) {
     };
 }
 
+// Add these helper functions at the top of the file
+function getRandomLocation(baseLocation) {
+    // NYC coordinates: 40.7128° N, -74.0060° W
+    const NYC = {
+        lat: 40.7128,
+        lng: -74.0060
+    };
+    
+    // Random offset within ~5km radius
+    const lat = NYC.lat + (Math.random() - 0.5) * 0.1;  // +/- ~5km in lat
+    const lng = NYC.lng + (Math.random() - 0.5) * 0.1;  // +/- ~5km in lng
+    
+    return { lat, lng };
+}
+
 // 1. Request Ride Endpoint
-app.post('/api/rides/request', async (req, res) => {
+app.patch('/api/rides/:rider_id/request', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        const { rider_id, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng } = req.body;
+        const rider_id = parseInt(req.params.rider_id, 10);
+        
+        // Generate random pickup and dropoff locations
+        const pickup = getRandomLocation();
+        const dropoff = getRandomLocation();
+
+        // Insert pickup location
+        const pickupLocationResult = await client.query(
+            `INSERT INTO Locations (latitude, longitude, location_type)
+            VALUES ($1, $2, 'pickup')
+            RETURNING location_id`,
+            [pickup.lat, pickup.lng]
+        );
+        const pickupLocationId = pickupLocationResult.rows[0].location_id;
+
+        // Insert dropoff location
+        const dropoffLocationResult = await client.query(
+            `INSERT INTO Locations (latitude, longitude, location_type)
+            VALUES ($1, $2, 'drop-off')
+            RETURNING location_id`,
+            [dropoff.lat, dropoff.lng]
+        );
+        const dropoffLocationId = dropoffLocationResult.rows[0].location_id;
 
         // Create ride record without assigning a driver
         const rideResult = await client.query(
             `INSERT INTO rides (
-                rider_id, 
                 status, 
-                pickup_lat, 
-                pickup_lng, 
-                dropoff_lat, 
-                dropoff_lng
+                pickup_location_id,
+                dropoff_location_id,
+                fare_amount,
+                ride_category
             )
-            VALUES ($1, 'requested', $2, $3, $4, $5)
-            RETURNING id`,
-            [rider_id, pickup_lat, pickup_lng, dropoff_lat, dropoff_lng]
+            VALUES ('requested', $1, $2, $3, $4)
+            RETURNING ride_id`,
+            [pickupLocationId, dropoffLocationId, 0, 'Economy']
         );
 
+        // Create ride record without assigning a driver
+        const user_rideResult = await client.query(
+            `INSERT INTO User_Ride (
+            user_id,
+            ride_id,
+            role,
+            start_time
+            )
+            VALUES ($1, $2, $3, NOW())`,
+            [rider_id, rideResult.rows[0].ride_id, 'rider']
+        );
+        
         // Get nearby available drivers (in a real application, you would use location-based queries)
         const availableDrivers = await client.query(
             `SELECT 
-                d.user_id,
-                d.current_location_lat,
-                d.current_location_lng
+                d.user_id
             FROM drivers d
             WHERE d.is_available = true`
         );
-
-        // In a real application, you would:
-        // 1. Send notifications to nearby drivers
-        // 2. Implement a timeout mechanism if no driver accepts
-        // 3. Use WebSocket or similar for real-time updates
-
+        
         await client.query('COMMIT');
         res.json({ 
-            ride_id: rideResult.rows[0].id,
+            ride_id: rideResult.rows[0].ride_id,
             available_drivers: availableDrivers.rows.length
         });
     } catch (error) {
@@ -87,7 +130,7 @@ app.post('/api/rides/request', async (req, res) => {
 });
 
 // 2. Accept Ride Endpoint
-app.post('/api/rides/:id/accept', async (req, res) => {
+app.patch('/api/rides/:id/accept', async (req, res) => {
     const client = await pool.connect();
     try {
         const rideId = parseInt(req.params.id, 10);
@@ -98,53 +141,68 @@ app.post('/api/rides/:id/accept', async (req, res) => {
         }
 
         await client.query('BEGIN');
+        
+        // Set transaction isolation level to SERIALIZABLE
+        await client.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
 
-        // Lock the ride record
+        // Get exclusive lock on the ride row immediately with NOWAIT
         const rideCheck = await client.query(
-            'SELECT id, status FROM rides WHERE id = $1 FOR UPDATE',
+            'SELECT ride_id, status FROM rides WHERE ride_id = $1 FOR UPDATE NOWAIT',
             [rideId]
-        );
+        ).catch(err => {
+            if (err.code === '55P03') { // lock_not_available
+                throw new Error('Ride is currently being processed');
+            }
+            throw err;
+        });
 
         if (rideCheck.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Ride not found' });
+            throw new Error('Ride not found');
         }
 
         if (rideCheck.rows[0].status !== 'requested') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Ride is not available' });
+            throw new Error('Ride is not available');
         }
 
-        // Check if driver is available
+        // Get exclusive lock on the driver row with NOWAIT
         const driverCheck = await client.query(
-            'SELECT user_id, is_available FROM drivers WHERE user_id = $1 FOR UPDATE',
+            'SELECT user_id, is_available FROM drivers WHERE user_id = $1 FOR UPDATE NOWAIT',
             [driverId]
-        );
+        ).catch(err => {
+            if (err.code === '55P03') { // lock_not_available
+                throw new Error('Driver is currently being processed');
+            }
+            throw err;
+        });
 
         if (driverCheck.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Driver not found' });
+            throw new Error('Driver not found');
         }
 
         if (!driverCheck.rows[0].is_available) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Driver is not available' });
+            throw new Error('Driver is not available');
         }
 
-        // Update ride status
+        // Update ride record after acquiring locks
         const updateRide = await client.query(
             `UPDATE rides 
-             SET status = 'accepted', 
-                 driver_id = $1, 
-                 accept_time = NOW() 
-             WHERE id = $2 AND status = 'requested' 
-             RETURNING id, status, driver_id, accept_time`,
-            [driverId, rideId]
+             SET status = 'accepted'
+             WHERE ride_id = $1 
+             RETURNING ride_id, status`,
+            [rideId]
+        );
+        // Update user_ride record after acquiring locks
+        const updateUserRide = await client.query(
+            `INSERT INTO user_ride (user_id, ride_id, role, start_time)
+            VALUES ($1, $2, $3, NOW())`,
+            [driverId, rideId, 'driver']
         );
 
         // Update driver availability
         await client.query(
-            'UPDATE drivers SET is_available = false WHERE user_id = $1',
+            `UPDATE drivers 
+             SET is_available = false
+             WHERE user_id = $1`,
             [driverId]
         );
 
@@ -158,12 +216,22 @@ app.post('/api/rides/:id/accept', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error accepting ride:', error);
+        
+        if (error.message.includes('being processed')) {
+            return res.status(409).json({ error: error.message });
+        }
+        if (error.message.includes('not found')) {
+            return res.status(404).json({ error: error.message });
+        }
+        if (error.message.includes('not available')) {
+            return res.status(400).json({ error: error.message });
+        }
+        
         return res.status(500).json({ error: 'Internal server error' });
     } finally {
         client.release();
     }
 });
-
 
 // 3. Get Ride Details Endpoint
 app.get('/api/rides/:ride_id', async (req, res) => {
@@ -172,16 +240,32 @@ app.get('/api/rides/:ride_id', async (req, res) => {
         
         const result = await pool.query(
             `SELECT 
-                r.*,
+                r.id,
+                r.status,
+                r.pickup_lat,
+                r.pickup_lng,
+                r.dropoff_lat,
+                r.dropoff_lng,
+                r.fare,
+                r.distance_km,
+                r.accept_time,
+                r.pickup_time,
+                r.end_time,
+                -- Rider details
+                u1.id as rider_id,
                 u1.name as rider_name,
+                -- Driver details
+                u2.id as driver_id,
                 u2.name as driver_name,
+                -- Vehicle details
                 d.vehicle_make,
                 d.vehicle_model,
-                d.plate_number
+                d.plate_number,
+                d.vehicle_type
             FROM rides r
-            JOIN users u1 ON r.rider_id = u1.id
+            INNER JOIN users u1 ON r.rider_id = u1.id
             LEFT JOIN users u2 ON r.driver_id = u2.id
-            LEFT JOIN drivers d ON u2.id = d.user_id
+            LEFT JOIN drivers d ON r.driver_id = d.user_id
             WHERE r.id = $1`,
             [ride_id]
         );
@@ -197,16 +281,23 @@ app.get('/api/rides/:ride_id', async (req, res) => {
 });
 
 // 4. Complete Ride Endpoint
-app.post('/api/rides/:ride_id/complete', async (req, res) => {
+app.patch('/api/rides/:ride_id/complete', async (req, res) => {
     const client = await pool.connect();
+
     try {
         await client.query('BEGIN');
 
         const { ride_id } = req.params;
+        const { rider_id } = req.body;
 
-        // Get ride details
+        // Validate input
+        if (!ride_id || isNaN(ride_id) || !rider_id || isNaN(rider_id)) {
+            return res.status(400).json({ error: 'Invalid ride_id or rider_id' });
+        }
+
+        // Fetch ride details with an exclusive lock
         const rideResult = await client.query(
-            'SELECT * FROM rides WHERE id = $1 FOR UPDATE',
+            'SELECT * FROM rides WHERE ride_id = $1 FOR UPDATE',
             [ride_id]
         );
 
@@ -215,47 +306,53 @@ app.post('/api/rides/:ride_id/complete', async (req, res) => {
         }
 
         const ride = rideResult.rows[0];
-        const route = generateRandomRoute({
-            lat: ride.pickup_lat,
-            lng: ride.pickup_lng
-        }, {
-            lat: ride.dropoff_lat,
-            lng: ride.dropoff_lng
-        });
 
-        const duration = Math.floor(Math.random() * 30 + 15); // Random duration 15-45 minutes
-        const fare = calculateFare(route.distance_km, duration);
 
-        // Update ride record
+
+        // Mark the ride as completed
         await client.query(
-            `UPDATE rides 
-             SET status = 'completed',
-                 end_time = CURRENT_TIMESTAMP,
-                 fare = $1,
-                 distance_km = $2,
-                 route_data = $3,
-                 version = version + 1
-             WHERE id = $4`,
-            [fare, route.distance_km, JSON.stringify(route), ride_id]
+            `UPDATE rides
+             SET status = 'completed'
+             WHERE ride_id = $1`,
+            [ride_id]
         );
 
-        // Create payment record
+        // Insert payment details
         await client.query(
-            `INSERT INTO payments (ride_id, amount, status)
-             VALUES ($1, $2, 'completed')`,
-            [ride_id, fare]
+            `INSERT INTO payments (ride_id, rider_id, payment_status)
+             VALUES ($1, $2, $3)`,
+            [ride_id, rider_id, "success"]
         );
-
+        // Update driver availability
+        await client.query(
+            `UPDATE drivers 
+             SET is_available = true
+             WHERE user_id = $1`,
+            [ride.driver_id]
+        );
+        // Commit the transaction
         await client.query('COMMIT');
-        res.json({ 
-            status: 'completed',
-            fare,
-            distance_km: route.distance_km,
-            duration_minutes: duration
+
+        // Respond with success
+        res.json({
+            status: 'success',
+            message: 'Ride completed',
+            payment_status: "success"
         });
+
     } catch (error) {
         await client.query('ROLLBACK');
-        res.status(500).json({ error: error.message });
+        console.error('Error completing ride:', error);
+
+        if (error.message === 'Ride not found') {
+            return res.status(404).json({ error: error.message });
+        }
+
+        if (error.message === 'Ride is not in progress') {
+            return res.status(400).json({ error: error.message });
+        }
+
+        return res.status(500).json({ error: 'Internal server error' });
     } finally {
         client.release();
     }
